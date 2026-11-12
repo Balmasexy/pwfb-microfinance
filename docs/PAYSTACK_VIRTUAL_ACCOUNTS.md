@@ -20,9 +20,11 @@ For backwards compatibility, Test mode can temporarily fall back to the existing
 
 Keep Test and Live webhook registrations separate. Configure the Paystack webhook for the active mode to:
 
-- `/webhooks/paystack/branch-dva`
+- Test: `/webhooks/paystack/branch-dva/test`
+- Live: `/webhooks/paystack/branch-dva/live`
+- Legacy Test alias: `/webhooks/paystack/branch-dva`
 
-The endpoint verifies the raw-body HMAC-SHA512 signature using the secret for the selected environment. The existing handler provisions and records **branch-level** dedicated virtual accounts and handles successful incoming transfers to those accounts.
+Each endpoint verifies the raw-body HMAC-SHA512 signature with the matching environment's secret. The existing handler provisions and records **branch-level** dedicated virtual accounts and handles successful incoming transfers to those accounts. Live webhooks require `PAYSTACK_LIVE_ENABLED=true`; Test webhooks continue to use the Test key even while Live mode is selected.
 
 ## Safe rollout
 
