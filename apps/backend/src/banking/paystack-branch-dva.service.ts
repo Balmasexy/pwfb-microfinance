@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { getPaystackVirtualAccountConfig } from './paystack-virtual-account-config';
 
 export type BranchDvaContact = {
   email: string;
@@ -15,19 +16,17 @@ export type BranchDvaContact = {
 
 @Injectable()
 export class PaystackBranchDvaService {
-  private readonly baseUrl = process.env.PAYSTACK_BASE_URL || 'https://api.paystack.co';
   constructor(private readonly prisma: PrismaService) {}
 
   private secret() {
-    const key = process.env.PAYSTACK_SECRET_KEY?.trim();
-    if (!key) throw new BadRequestException('PAYSTACK_SECRET_KEY is not configured');
-    return key;
+    return getPaystackVirtualAccountConfig().secretKey;
   }
 
   private async request(path: string, options: RequestInit = {}) {
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const config = getPaystackVirtualAccountConfig();
+    const response = await fetch(`${config.baseUrl}${path}`, {
       ...options,
-      headers: { Authorization: `Bearer ${this.secret()}`, 'Content-Type': 'application/json', ...(options.headers || {}) },
+      headers: { Authorization: `Bearer ${config.secretKey}`, 'Content-Type': 'application/json', ...(options.headers || {}) },
     });
     const data = await response.json().catch(() => null);
     if (!response.ok || !data?.status) throw new BadRequestException(data?.message || 'Paystack request failed');
@@ -43,6 +42,8 @@ export class PaystackBranchDvaService {
   }
 
   async provision(branchId: string, contact: BranchDvaContact) {
+    // Validate the selected Test/Live virtual-account credentials before local state changes.
+    this.secret();
     const branch = await this.prisma.branch.findUnique({ where: { id: branchId } });
     if (!branch) throw new NotFoundException('Branch not found');
     const email = String(contact?.email || '').trim().toLowerCase();
@@ -116,8 +117,9 @@ export class PaystackBranchDvaService {
   }
 
   verifyWebhookSignature(rawBody: Buffer, signature?: string) {
-    const secret = process.env.PAYSTACK_SECRET_KEY;
-    if (!secret || !signature) return false;
+    if (!signature) return false;
+    let secret: string;
+    try { secret = this.secret(); } catch { return false; }
     const expected = createHmac('sha512', secret).update(rawBody).digest('hex');
     const a = Buffer.from(expected, 'utf8'); const b = Buffer.from(signature, 'utf8');
     return a.length === b.length && timingSafeEqual(a, b);
