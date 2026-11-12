@@ -116,10 +116,10 @@ export class PaystackBranchDvaService {
     `;
   }
 
-  verifyWebhookSignature(rawBody: Buffer, signature?: string) {
+  verifyWebhookSignature(rawBody: Buffer, signature?: string, environment?: 'test' | 'live') {
     if (!signature) return false;
     let secret: string;
-    try { secret = this.secret(); } catch { return false; }
+    try { secret = getPaystackVirtualAccountConfig(environment).secretKey; } catch { return false; }
     const expected = createHmac('sha512', secret).update(rawBody).digest('hex');
     const a = Buffer.from(expected, 'utf8'); const b = Buffer.from(signature, 'utf8');
     return a.length === b.length && timingSafeEqual(a, b);
