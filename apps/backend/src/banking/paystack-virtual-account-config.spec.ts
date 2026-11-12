@@ -47,6 +47,15 @@ describe('Paystack virtual-account environment configuration', () => {
     expect(() => getPaystackVirtualAccountConfig()).toThrow('PAYSTACK_LIVE_SECRET_KEY');
   });
 
+  it('can resolve a distinct Test webhook key while Live is selected', () => {
+    process.env.PAYSTACK_ENVIRONMENT = 'live';
+    process.env.PAYSTACK_LIVE_SECRET_KEY = 'sk_live_dva';
+    process.env.PAYSTACK_LIVE_ENABLED = 'true';
+    process.env.PAYSTACK_TEST_SECRET_KEY = 'sk_test_dva';
+    expect(getPaystackVirtualAccountConfig('test').secretKey).toBe('sk_test_dva');
+    expect(getPaystackVirtualAccountConfig('live').secretKey).toBe('sk_live_dva');
+  });
+
   it('requires an explicit live enable switch and a live-prefixed key', () => {
     process.env.PAYSTACK_ENVIRONMENT = 'live';
     process.env.PAYSTACK_LIVE_SECRET_KEY = 'sk_live_virtual_account_key';
