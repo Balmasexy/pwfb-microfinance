@@ -13,8 +13,8 @@ export type PaystackVirtualAccountConfig = {
  * Test mode keeps PAYSTACK_SECRET_KEY as a backwards-compatible fallback.
  * Live mode always requires its own secret and an explicit live enable switch.
  */
-export function getPaystackVirtualAccountConfig(): PaystackVirtualAccountConfig {
-  const configured = String(process.env.PAYSTACK_ENVIRONMENT || 'test').trim().toLowerCase();
+export function getPaystackVirtualAccountConfig(environmentOverride?: PaystackVirtualAccountEnvironment): PaystackVirtualAccountConfig {
+  const configured = String(environmentOverride || process.env.PAYSTACK_ENVIRONMENT || 'test').trim().toLowerCase();
   if (configured !== 'test' && configured !== 'live') {
     throw new ServiceUnavailableException('PAYSTACK_ENVIRONMENT must be test or live');
   }
