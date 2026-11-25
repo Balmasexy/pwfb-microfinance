@@ -31,6 +31,18 @@ Do not put these values in frontend code, Git commits, screenshots, public docum
 
 A webhook request must never be treated as proof of payment simply because it reached the endpoint.
 
+### Paystack staff BVN verification
+
+Callback route:
+
+```text
+POST /webhooks/staff/bvn/paystack
+Events: customeridentification.success, customeridentification.failed
+```
+
+Paystack's current `Paystack-Signature` header uses the mode-specific webhook signing secret (`whsec_`). Configure the Live signing secret as `PAYSTACK_WEBHOOK_SECRET` on the PWFB backend. PWFB also accepts the legacy `X-Paystack-Signature` header using `PAYSTACK_SECRET_KEY` during migration. Keep the integration secret key configured while Paystack is still sending the legacy header.
+
+Staff identity verification is asynchronous. PWFB stores the Paystack customer reference before submitting identification, reuses the same customer for retries tied to the same BVN, and checks the Paystack customer `identified` flag as a fallback when webhook delivery is delayed. The backend cannot independently prove that an endpoint is registered in the Paystack Dashboard; confirm the exact Live URL and both event subscriptions in the Dashboard.
 ## 3. Supported PWFB webhook areas
 
 - Flutterwave payment and virtual-account callbacks.
