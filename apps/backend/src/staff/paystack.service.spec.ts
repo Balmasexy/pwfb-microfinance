@@ -41,4 +41,11 @@ describe('PaystackService webhook signature verification', () => {
     delete process.env.PAYSTACK_WEBHOOK_SECRET;
     expect(service.verifyWebhookSignature(rawBody, undefined, 't=1,v1=whk_test:' + '0'.repeat(128))).toBe(false);
   });
+  it('keeps legacy verification working until the whsec_ secret is configured', () => {
+    const rawBody = Buffer.from('{"event":"customeridentification.success"}');
+    process.env.PAYSTACK_SECRET_KEY = 'sk_live_unit_test_secret';
+    delete process.env.PAYSTACK_WEBHOOK_SECRET;
+    const legacy = createHmac('sha512', process.env.PAYSTACK_SECRET_KEY).update(rawBody).digest('hex');
+    expect(service.verifyWebhookSignature(rawBody, legacy, 't=1,v1=whk_not_configured:' + '0'.repeat(128))).toBe(true);
+  });
 });
