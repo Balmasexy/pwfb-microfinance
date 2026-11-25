@@ -19,8 +19,10 @@ export class StaffService {
   private hashBvn(bvn: string) { return createHash('sha256').update(String(bvn).replace(/\D/g, '')).digest('hex'); }
 
   private async ensureBvnVerificationTable() {
-    await this.prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "StaffBvnVerification" ("id" TEXT PRIMARY KEY,"reference" TEXT NOT NULL UNIQUE,"bvnHash" TEXT,"requestedFirstName" TEXT NOT NULL,"requestedLastName" TEXT NOT NULL,"firstName" TEXT,"middleName" TEXT,"lastName" TEXT,"fullName" TEXT,"status" TEXT NOT NULL DEFAULT 'PENDING',"message" TEXT,"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,"updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,"verifiedAt" TIMESTAMP(3))`);
+    await this.prisma.$executeRawUnsafe(`CREATE TABLE IF NOT EXISTS "StaffBvnVerification" ("id" TEXT PRIMARY KEY,"reference" TEXT NOT NULL UNIQUE,"bvnHash" TEXT,"bankCode" TEXT,"accountNumberHash" TEXT,"requestedFirstName" TEXT NOT NULL,"requestedLastName" TEXT NOT NULL,"firstName" TEXT,"middleName" TEXT,"lastName" TEXT,"fullName" TEXT,"status" TEXT NOT NULL DEFAULT 'PENDING',"message" TEXT,"createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,"updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,"verifiedAt" TIMESTAMP(3))`);
     await this.prisma.$executeRawUnsafe(`ALTER TABLE "StaffBvnVerification" ADD COLUMN IF NOT EXISTS "bvnHash" TEXT`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE "StaffBvnVerification" ADD COLUMN IF NOT EXISTS "bankCode" TEXT`);
+    await this.prisma.$executeRawUnsafe(`ALTER TABLE "StaffBvnVerification" ADD COLUMN IF NOT EXISTS "accountNumberHash" TEXT`);
     await this.prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "StaffBvnVerification_bvnHash_idx" ON "StaffBvnVerification" ("bvnHash")`);
   }
 
@@ -32,39 +34,87 @@ export class StaffService {
     const firstName = String(input.firstName || '').trim();
     const lastName = String(input.lastName || '').trim();
     if (!firstName || !lastName) throw new BadRequestException('First name and last name are required');
+
     const account = await this.paystack.resolveAccount(input.bankCode, input.accountNumber);
-    const email = `${this.normalizeName(firstName)}.${this.normalizeName(lastName)}+kyc${Date.now()}@pwfb.com`;
-    const customer = await this.paystack.createCustomer({ email, firstName, lastName });
-    const validation = await this.paystack.validateCustomer({ customerCode: customer.customerCode, bvn, firstName, lastName, middleName: input.middleName?.trim(), accountNumber: account.accountNumber, bankCode: account.bankCode });
     await this.ensureBvnVerificationTable();
-    await this.prisma.$executeRawUnsafe(`INSERT INTO "StaffBvnVerification" ("id","reference","bvnHash","requestedFirstName","requestedLastName","status","message") VALUES ($1,$2,$3,$4,$5,'PENDING',$6) ON CONFLICT ("reference") DO UPDATE SET "bvnHash"=EXCLUDED."bvnHash","requestedFirstName"=EXCLUDED."requestedFirstName","requestedLastName"=EXCLUDED."requestedLastName","status"='PENDING',"message"=EXCLUDED."message","updatedAt"=CURRENT_TIMESTAMP`, randomUUID(), customer.customerCode, this.hashBvn(bvn), firstName, lastName, validation.message || 'Paystack BVN and bank-account verification in progress');
-    return { verified: false, pending: true, reference: customer.customerCode, accountName: account.accountName, bankCode: account.bankCode, accountNumber: account.accountNumber, message: validation.message || 'Paystack accepted the identity verification request. Waiting for verification.' };
+    const bvnHash = this.hashBvn(bvn);
+    const accountNumberHash = createHash('sha256').update(`${account.bankCode}:${account.accountNumber}`).digest('hex');
+    const existingRows = await this.prisma.$queryRawUnsafe<any[]>(`SELECT "id","reference","status","bankCode","accountNumberHash" FROM "StaffBvnVerification" WHERE "bvnHash"=$1 ORDER BY "updatedAt" DESC LIMIT 1`, bvnHash);
+    const existing = existingRows[0];
+    const sameAccount = Boolean(existing && existing.bankCode === account.bankCode && existing.accountNumberHash === accountNumberHash);
+
+    if (existing && sameAccount && String(existing.status).toUpperCase() === 'COMPLETED') {
+      return { verified: true, pending: false, reference: existing.reference, accountName: account.accountName, bankCode: account.bankCode, accountNumber: account.accountNumber, message: 'This BVN and bank account have already been verified.' };
+    }
+    if (existing && sameAccount && String(existing.status).toUpperCase() === 'PENDING') {
+      return { verified: false, pending: true, reference: existing.reference, accountName: account.accountName, bankCode: account.bankCode, accountNumber: account.accountNumber, message: 'Your existing Paystack verification is still processing. Resuming that request.' };
+    }
+
+    let customerCode = String(existing?.reference || '').trim();
+    if (!customerCode) {
+      // The deterministic alias avoids creating a new Paystack customer per retry.
+      const email = `pwfb.kyc.${bvnHash.slice(0, 24)}@pwfb.com`;
+      const customer = await this.paystack.createCustomer({ email, firstName, lastName });
+      customerCode = customer.customerCode;
+      // Persist the reference before requesting identification so a fast webhook
+      // can always find its local verification row.
+      await this.prisma.$executeRawUnsafe(`INSERT INTO "StaffBvnVerification" ("id","reference","bvnHash","bankCode","accountNumberHash","requestedFirstName","requestedLastName","status","message") VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8)`, randomUUID(), customerCode, bvnHash, account.bankCode, accountNumberHash, firstName, lastName, 'Paystack identity verification submitted; waiting for the provider result.');
+    } else {
+      // Reuse the persisted customer after a rejected attempt or corrected details.
+      await this.prisma.$executeRawUnsafe(`UPDATE "StaffBvnVerification" SET "bankCode"=$1,"accountNumberHash"=$2,"requestedFirstName"=$3,"requestedLastName"=$4,"status"='PENDING',"message"=$5,"updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$6`, account.bankCode, accountNumberHash, firstName, lastName, 'Corrected details submitted to Paystack; waiting for the provider result.', existing.id);
+    }
+
+    try {
+      const validation = await this.paystack.validateCustomer({ customerCode, bvn, firstName, lastName, middleName: input.middleName?.trim(), accountNumber: account.accountNumber, bankCode: account.bankCode });
+      const message = validation.message || 'Paystack accepted the identity verification request. Waiting for verification.';
+      await this.prisma.$executeRawUnsafe(`UPDATE "StaffBvnVerification" SET "message"=$1,"updatedAt"=CURRENT_TIMESTAMP WHERE "reference"=$2`, message, customerCode);
+      return { verified: false, pending: true, reference: customerCode, accountName: account.accountName, bankCode: account.bankCode, accountNumber: account.accountNumber, message };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Paystack could not submit the identity verification request.';
+      await this.prisma.$executeRawUnsafe(`UPDATE "StaffBvnVerification" SET "status"='FAILED',"message"=$1,"updatedAt"=CURRENT_TIMESTAMP WHERE "reference"=$2`, message, customerCode);
+      throw error;
+    }
   }
 
   async getBvnVerification(reference: string) {
-    const ref = String(reference || '').trim(); if (!ref) throw new BadRequestException('Paystack verification reference is required');
+    const ref = String(reference || '').trim();
+    if (!ref) throw new BadRequestException('Paystack verification reference is required');
     await this.ensureBvnVerificationTable();
-    const rows = await this.prisma.$queryRawUnsafe<any[]>(`SELECT "reference","status","requestedFirstName","requestedLastName","firstName","middleName","lastName","fullName","message" FROM "StaffBvnVerification" WHERE "reference" = $1 LIMIT 1`, ref); const row = rows[0];
+    const rows = await this.prisma.$queryRawUnsafe<any[]>(`SELECT "reference","status","requestedFirstName","requestedLastName","firstName","middleName","lastName","fullName","message" FROM "StaffBvnVerification" WHERE "reference"=$1 LIMIT 1`, ref);
+    const row = rows[0];
     if (!row) throw new NotFoundException('Paystack BVN verification request not found');
+    let status = String(row.status || 'PENDING').toUpperCase();
     let firstName = row.firstName || row.requestedFirstName;
     let middleName = row.middleName || '';
     let lastName = row.lastName || row.requestedLastName;
     let fullName = row.fullName || [firstName, middleName, lastName].filter(Boolean).join(' ');
-    if (row.status === 'COMPLETED') {
+    let message = row.message || '';
+
+    // Poll the provider record as a fallback when webhook delivery is delayed.
+    if (status === 'PENDING' || status === 'COMPLETED') {
       try {
         const customer = await this.paystack.getCustomer(ref);
         if (customer.firstName) firstName = customer.firstName;
         if (customer.middleName) middleName = customer.middleName;
         if (customer.lastName) lastName = customer.lastName;
         fullName = [firstName, middleName, lastName].filter(Boolean).join(' ');
-      } catch (_) {}
+        if (status === 'PENDING' && customer.identified) {
+          status = 'COMPLETED';
+          message = 'Paystack identity verification confirmed from the customer record.';
+          await this.prisma.$executeRawUnsafe(`UPDATE "StaffBvnVerification" SET "firstName"=$1,"middleName"=$2,"lastName"=$3,"fullName"=$4,"status"='COMPLETED',"message"=$5,"updatedAt"=CURRENT_TIMESTAMP,"verifiedAt"=CURRENT_TIMESTAMP WHERE "reference"=$6`, firstName || null, middleName || null, lastName || null, fullName || null, message, ref);
+        }
+      } catch (_) {
+        // Retain the stored state; the signed webhook remains the async update path.
+      }
     }
-    return { verified: row.status === 'COMPLETED', pending: row.status === 'PENDING', reference: row.reference, firstName, middleName, lastName, fullName, status: row.status, message: row.message || '' };
+    return { verified: status === 'COMPLETED', pending: status === 'PENDING', reference: row.reference, firstName, middleName, lastName, fullName, status, message };
   }
 
-  async handleBvnWebhook(body: any, signature?: string, rawBody?: Buffer) {
-    const raw = rawBody && Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(JSON.stringify(body || {}));
-    if (!this.paystack.verifyWebhookSignature(raw, signature)) throw new BadRequestException('Invalid Paystack webhook signature');
+  async handleBvnWebhook(body: any, legacySignature?: string, rawBody?: Buffer, signingSignature?: string) {
+    if (!rawBody || !Buffer.isBuffer(rawBody)) throw new BadRequestException('Paystack webhook raw request body is unavailable.');
+    if (!this.paystack.verifyWebhookSignature(rawBody, legacySignature, signingSignature)) {
+      throw new BadRequestException('Invalid Paystack webhook signature. Check the Live signing secret or legacy integration secret.');
+    }
     const event = String(body?.event || '').toLowerCase();
     if (!['customeridentification.success','customeridentification.failed'].includes(event)) return { ok: true, ignored: true, event };
     const data = body?.data || {};
@@ -92,7 +142,22 @@ export class StaffService {
     return { ok: true, verified: !failed, reference, status: failed ? 'FAILED' : 'COMPLETED', bankCode: identification?.bank_code || null };
   }
 
-  async bvnConfigurationStatus() { return { configured: this.paystack.isConfigured(), source: this.paystack.isConfigured() ? 'PAYSTACK_SECRET_KEY' : null, webhookConfigured: this.paystack.isConfigured(), environment: process.env.NODE_ENV || 'unknown', api: 'https://api.paystack.co/customer/:code/identification', secretValueExposed: false }; }
+  async bvnConfigurationStatus() {
+    const baseUrl = String(process.env.PWFB_PUBLIC_API_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/$/, '');
+    return {
+      configured: this.paystack.isConfigured(),
+      source: this.paystack.isConfigured() ? 'PAYSTACK_SECRET_KEY' : null,
+      webhookConfigured: null,
+      webhookRegistration: 'unknown_until_checked_in_paystack_dashboard',
+      webhookSignatureReady: Boolean(this.paystack.webhookSignatureMode()),
+      webhookSignatureMode: this.paystack.webhookSignatureMode(),
+      webhookUrl: baseUrl ? `${baseUrl}/webhooks/staff/bvn/paystack` : null,
+      webhookEvents: ['customeridentification.success', 'customeridentification.failed'],
+      environment: process.env.NODE_ENV || 'unknown',
+      api: 'https://api.paystack.co/customer/:code/identification',
+      secretValueExposed: false,
+    };
+  }
 
   async create(createStaffDto: CreateStaffDto) {
     const registrationData: any = { ...createStaffDto };
