@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 @Injectable()
 export class PaystackService {
@@ -78,14 +79,34 @@ export class PaystackService {
     return { accepted: Boolean(payload?.status), message: String(payload?.message || 'Customer identification in progress'), customerCode: input.customerCode };
   }
 
-  verifyWebhookSignature(rawBody: Buffer, signature?: string) {
-    const crypto = require('node:crypto') as typeof import('node:crypto');
+  /** Verify current Paystack-Signature (whsec_) and legacy X-Paystack-Signature. */
+  verifyWebhookSignature(rawBody: Buffer, legacySignature?: string, signingSignature?: string) {
+    if (!Buffer.isBuffer(rawBody)) return false;
+    const signingSecret = String(process.env.PAYSTACK_WEBHOOK_SECRET || '').trim();
+    if (signingSignature) {
+      if (!signingSecret.startsWith('whsec_')) return false;
+      const parts = String(signingSignature).split(',').map((part) => part.trim());
+      const timestampPart = parts.find((part) => part.startsWith('t='));
+      const timestamp = Number(timestampPart?.slice(2));
+      if (!Number.isFinite(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - timestamp) > 300) return false;
+      const expected = createHmac('sha512', signingSecret).update(`${timestamp}.`).update(rawBody).digest();
+      const candidates = parts.filter((part) => part.startsWith('v1=')).map((part) => part.slice(3).split(':').slice(1).join(':')).filter((value) => /^[a-f0-9]{128}$/i.test(value));
+      return candidates.some((candidate) => {
+        const actual = Buffer.from(candidate, 'hex');
+        return actual.length === expected.length && timingSafeEqual(actual, expected);
+      });
+    }
     const secret = String(process.env.PAYSTACK_SECRET_KEY || '').trim();
-    if (!secret || !signature) return false;
-    const expected = crypto.createHmac('sha512', secret).update(rawBody).digest('hex');
-    const a = Buffer.from(expected, 'utf8');
-    const b = Buffer.from(String(signature).trim(), 'utf8');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!secret || !legacySignature || !/^[a-f0-9]{128}$/i.test(String(legacySignature).trim())) return false;
+    const expected = createHmac('sha512', secret).update(rawBody).digest();
+    const actual = Buffer.from(String(legacySignature).trim(), 'hex');
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  }
+
+  webhookSignatureMode() {
+    if (String(process.env.PAYSTACK_WEBHOOK_SECRET || '').trim().startsWith('whsec_')) return 'Paystack-Signature';
+    if (String(process.env.PAYSTACK_SECRET_KEY || '').trim()) return 'X-Paystack-Signature (legacy)';
+    return null;
   }
 
   isConfigured() { return Boolean(String(process.env.PAYSTACK_SECRET_KEY || '').trim()); }
