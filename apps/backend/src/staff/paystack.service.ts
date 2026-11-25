@@ -83,8 +83,7 @@ export class PaystackService {
   verifyWebhookSignature(rawBody: Buffer, legacySignature?: string, signingSignature?: string) {
     if (!Buffer.isBuffer(rawBody)) return false;
     const signingSecret = String(process.env.PAYSTACK_WEBHOOK_SECRET || '').trim();
-    if (signingSignature) {
-      if (!signingSecret.startsWith('whsec_')) return false;
+    if (signingSignature && signingSecret.startsWith('whsec_')) {
       const parts = String(signingSignature).split(',').map((part) => part.trim());
       const timestampPart = parts.find((part) => part.startsWith('t='));
       const timestamp = Number(timestampPart?.slice(2));
